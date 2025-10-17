@@ -150,7 +150,7 @@ def fetch_and_store_movies():
             doc = {
                 "title": snippet.get("title", ""),
                 "videoId": video_id,
-                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "url": f"https://www.youtube.com/embed/{video_id}",
                 "thumbnail": thumb_url,
                 "durationSeconds": duration_sec,
                 "publishedAt": snippet.get("publishedAt", "")
