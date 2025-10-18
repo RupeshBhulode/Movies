@@ -53,12 +53,15 @@ def daily_job():
 # --------------------------------------
 # 3️⃣ Schedule Job
 # --------------------------------------
-
 def start_scheduler():
-    # 🔁 Run the job every 1 hour
-    scheduler.add_job(daily_job, "interval", hours=1)
+    scheduler.add_job(
+        daily_job,
+        "interval",
+        hours=1,
+        next_run_time=datetime.now()  # 👈 Run immediately once
+    )
     scheduler.start()
-    print("🕒 Scheduler started: job runs every 1 hour.")
+    print("🕒 Scheduler started: job runs every 1 hour (first run immediately).")
 
 
 @app.on_event("startup")
