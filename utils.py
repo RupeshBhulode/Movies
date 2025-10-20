@@ -5,7 +5,7 @@ import isodate
 import time
 import firebase_admin
 from firebase_admin import credentials, firestore
-import os
+import os, json
 
 # =====================================
 # 🔑 CONFIGURATION
@@ -41,7 +41,8 @@ youtube = get_youtube_client()
 
 def safe_api_call(func, *args, **kwargs):
     global current_key_index, youtube
-    while True:
+    retries = 3
+    while retries > 0:
         try:
             return func(*args, **kwargs).execute()
         except HttpError as e:
@@ -51,9 +52,17 @@ def safe_api_call(func, *args, **kwargs):
                     raise Exception("🚫 All API keys exhausted for today.")
                 print(f"⚠️ Quota exhausted. Switching to API key #{current_key_index + 1}")
                 youtube = get_youtube_client()
-                time.sleep(0.5)
+                time.sleep(1)
                 continue
-            raise
+            else:
+                print(f"⚠️ YouTube API Error: {e}")
+                retries -= 1
+                time.sleep(2)
+        except Exception as e:
+            print(f"❌ Network or Unknown Error: {e}")
+            retries -= 1
+            time.sleep(2)
+    raise Exception("❌ API call failed after retries.")
 
 # =====================================
 # ⏱ UTILS
@@ -68,8 +77,6 @@ def get_video_duration_seconds(iso_duration: str) -> int:
 # =====================================
 # 🔥 FIRESTORE SETUP
 # =====================================
-import json
-
 firebase_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
 
 if not firebase_admin._apps:
@@ -80,7 +87,6 @@ if not firebase_admin._apps:
         cred = credentials.Certificate("serviceAccountKey.json")
     firebase_admin.initialize_app(cred)
 
-
 db = firestore.client()
 
 # =====================================
@@ -88,79 +94,109 @@ db = firestore.client()
 # =====================================
 def fetch_and_store_movies():
     """
-    Fetch 5 latest (>45min) free movies for each Hindi category
-    and store directly to Firestore (unique by videoId).
+    Fetch as many valid long movies as possible for each category and store all unique ones.
     """
     for category in CATEGORIES:
-        print(f"🎬 Fetching movies for: {category}")
+        print(f"\n🎬 Fetching movies for: {category}")
 
-        # Step 1: Fetch latest videos for this category
-        search_resp = safe_api_call(
-            youtube.search().list,
-            q=category + " full movie free",
-            part="id",
-            type="video",
-            order="date",          # ✅ newest first
-            maxResults=10,         # fetch 10 then filter
-            videoDuration="long",
-            safeSearch="none"
-        )
+        total_stored = 0
+        page_token = None
+        max_pages = 10   # YouTube API allows up to ~500 results (10 pages × 50)
 
-        video_ids = [
-            item["id"]["videoId"]
-            for item in search_resp.get("items", [])
-            if item.get("id", {}).get("videoId")
-        ]
+        for page_num in range(1, max_pages + 1):
+            print(f"🔹 Page {page_num}...")
 
-        if not video_ids:
-            continue
-
-        # Step 2: Get video details
-        details_resp = safe_api_call(
-            youtube.videos().list,
-            part="snippet,contentDetails,liveStreamingDetails",
-            id=",".join(video_ids)
-        )
-
-        count = 0
-        for item in details_resp.get("items", []):
-            if count >= 5:   # ✅ only 5 per category
+            try:
+                search_resp = safe_api_call(
+                    youtube.search().list,
+                    q=f"{category} full movie free",
+                    part="id",
+                    type="video",
+                    order="date",
+                    maxResults=50,
+                    videoDuration="long",
+                    safeSearch="none",
+                    pageToken=page_token
+                )
+            except Exception as e:
+                print(f"⚠️ Error fetching page: {e}")
                 break
 
-            video_id = item.get("id")
-            snippet = item.get("snippet", {}) or {}
-            content = item.get("contentDetails", {}) or {}
+            video_ids = [
+                item["id"]["videoId"]
+                for item in search_resp.get("items", [])
+                if item.get("id", {}).get("videoId")
+            ]
 
-            if not video_id or not snippet:
-                continue
-            if "liveStreamingDetails" in item:
-                continue
+            if not video_ids:
+                print("⚠️ No videos found on this page.")
+                break
 
-            duration_sec = get_video_duration_seconds(content.get("duration", ""))
-            if duration_sec < 2700:
-                continue
+            # Fetch detailed info for these videos
+            details_resp = safe_api_call(
+                youtube.videos().list,
+                part="snippet,contentDetails,liveStreamingDetails",
+                id=",".join(video_ids)
+            )
 
-            thumbnails = snippet.get("thumbnails", {}) or {}
-            thumb_url = ""
-            for k in ("maxres", "standard", "high", "medium", "default"):
-                if k in thumbnails and thumbnails[k].get("url"):
-                    thumb_url = thumbnails[k]["url"]
-                    break
+            batch = db.batch()
+            batch_count = 0
 
-            doc = {
-                "title": snippet.get("title", ""),
-                "videoId": video_id,
-                "url": f"https://www.youtube.com/embed/{video_id}",
-                "thumbnail": thumb_url,
-                "durationSeconds": duration_sec,
-                "publishedAt": snippet.get("publishedAt", "")
-            }
+            for item in details_resp.get("items", []):
+                video_id = item.get("id")
+                snippet = item.get("snippet", {})
+                content = item.get("contentDetails", {})
 
-            # Step 3: Store in Firestore (unique only)
-            doc_ref = db.collection(category).document(video_id)
-            if doc_ref.get().exists:
-                continue
+                if not video_id or not snippet or "liveStreamingDetails" in item:
+                    continue
 
-            doc_ref.set(doc)
-            count += 1
-            print(f"✅ Stored: {doc['title'][:60]}... in {category}")
+                # Filter: only full-length movies (45+ min)
+                duration_sec = get_video_duration_seconds(content.get("duration", ""))
+                if duration_sec < 2700:
+                    continue
+
+                # Pick best thumbnail available
+                thumbnails = snippet.get("thumbnails", {})
+                thumb_url = ""
+                for k in ("maxres", "standard", "high", "medium", "default"):
+                    if k in thumbnails and thumbnails[k].get("url"):
+                        thumb_url = thumbnails[k]["url"]
+                        break
+
+                doc_ref = db.collection(category).document(video_id)
+                if doc_ref.get().exists:
+                    continue  # skip duplicates
+
+                data = {
+                    "title": snippet.get("title", ""),
+                    "videoId": video_id,
+                    "url": f"https://www.youtube.com/embed/{video_id}",
+                    "thumbnail": thumb_url,
+                    "durationSeconds": duration_sec,
+                    "publishedAt": snippet.get("publishedAt", ""),
+                    "fetchedAt": firestore.SERVER_TIMESTAMP
+                }
+
+                batch.set(doc_ref, data)
+                batch_count += 1
+                total_stored += 1
+
+                # Firestore batch limit = 500 writes per batch
+                if batch_count == 500:
+                    batch.commit()
+                    batch = db.batch()
+                    batch_count = 0
+                    print(f"💾 Committed 500 movies (partial batch) in {category}")
+
+            # Commit remaining batch for this page
+            if batch_count > 0:
+                batch.commit()
+                print(f"💾 Committed {batch_count} new movies in {category}")
+
+            # Move to next page
+            page_token = search_resp.get("nextPageToken")
+            if not page_token:
+                print("🚫 No more pages available.")
+                break
+
+        print(f"📦 Total new movies stored in {category}: {total_stored}")
